@@ -1,5 +1,9 @@
+import os
 import random
 import requests
+
+URL = os.getenv("TT_URL", "http://127.0.0.1:8000") + "/report"
+HEADERS = {"X-API-Key": os.getenv("TT_API_KEY", "")}
 
 for i in range(20):
     payload = {
@@ -9,5 +13,5 @@ for i in range(20):
         "vibration": round(random.uniform(1.5, 4.0), 2),
         "event": "possible_pothole",
     }
-    r = requests.post("http://127.0.0.1:8000/report", json=payload)
+    r = requests.post(URL, json=payload, headers=HEADERS)
     print(r.status_code, r.json())
