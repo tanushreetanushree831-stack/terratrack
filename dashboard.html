@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TerraTrack Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css">
+
+  <style>
+    html, body { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+    #bar { height: 44px; background: #1f2937; color: #fff; display: flex;
+           align-items: center; padding: 0 16px; gap: 20px; }
+    #bar b { font-size: 18px; }
+    #bar a { margin-left: auto; color: #fff; background: #2563eb; padding: 6px 12px;
+         border-radius: 4px; text-decoration: none; font-size: 14px; }
+    #map { height: calc(100% - 44px); }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <b>TerraTrack</b>
+    <span id="count">Loading...</span>
+    <span id="updated"></span>
+    <a href="/pothole-report" target="_blank">Generate report</a>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script>
+const map = L.map("map").setView([12.9716, 77.5946], 16);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: "&copy; OpenStreetMap contributors"
+}).addTo(map);
+
+const verifiedLayer = L.layerGroup().addTo(map);
+const unconfirmedLayer = L.markerClusterGroup().addTo(map);
+let firstLoad = true;
+
+function popupHtml(p) {
+  return `<b>${p.status.toUpperCase()}</b><br>` +
+         `Devices: ${p.device_count}<br>` +
+         `Reports: ${p.report_count}<br>` +
+         `Avg vibration: ${p.avg_vibration} (max ${p.max_vibration})<br>` +
+         `Last seen: ${new Date(p.last_seen + "Z").toLocaleString()}`;
+}
+
+async function loadPotholes() {
+  try {
+    const res = await fetch("/potholes");
+    const spots = await res.json();
+
+    verifiedLayer.clearLayers();
+    unconfirmedLayer.clearLayers();
+
+    let v = 0, u = 0;
+    const points = [];
+    spots.forEach(p => {
+      points.push([p.latitude, p.longitude]);
+      if (p.status === "verified") {
+        v++;
+        L.circleMarker([p.latitude, p.longitude], {
+          radius: 12, color: "#7f1d1d", weight: 2,
+          fillColor: "#dc2626", fillOpacity: 0.9
+        }).bindPopup(popupHtml(p)).addTo(verifiedLayer);
+      } else {
+        u++;
+        L.circleMarker([p.latitude, p.longitude], {
+          radius: 6, color: "#555", weight: 1,
+          fillColor: "#9ca3af", fillOpacity: 0.8
+        }).bindPopup(popupHtml(p)).addTo(unconfirmedLayer);
+      }
+    });
+
+    document.getElementById("count").textContent =
+      v + " verified, " + u + " unconfirmed";
+    document.getElementById("updated").textContent =
+      "Updated " + new Date().toLocaleTimeString();
+
+    if (firstLoad && points.length) {
+      map.fitBounds(points, { padding: [40, 40] });
+      firstLoad = false;
+    }
+  } catch (err) {
+    document.getElementById("count").textContent = "Cannot reach API";
+    console.error(err);
+  }
+}
+
+loadPotholes();
+setInterval(loadPotholes, 10000);
+  </script>
+</body>
+</html>
