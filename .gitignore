@@ -1,3 +1,4 @@
+local_env.bat
 venv/
 __pycache__/
 *.db

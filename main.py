@@ -1,36 +1,35 @@
 import csv
 import html
 import io
-import math
+import os
+import secrets
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 from urllib.parse import urlencode
 
-import os
-import secrets
 from fastapi import FastAPI, Query, Depends, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
+from sqlalchemy import create_engine, text, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # ---------- Settings you can edit ----------
 PROJECT_NAME = "TerraTrack"
 PREPARED_BY = "Yantra Vidya"   # <- change this before submitting
 IST = timezone(timedelta(hours=5, minutes=30))
+METRIC_SRID = 32643   # UTM zone 43N: lets PostGIS measure distances in metres (suits Bengaluru/south India)
 
-# ---------- Database ----------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///terratrack.db")
+# ---------- Database (PostgreSQL + PostGIS) ----------
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Set it to your Neon connection string.")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-else:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)  # Neon sleeps when idle
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)  # Neon sleeps when idle
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -46,7 +45,20 @@ class RoadEvent(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 
+# One-time setup that is safe to repeat on every start
+with engine.begin() as conn:
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
 Base.metadata.create_all(engine)
+with engine.begin() as conn:
+    # PostGIS point built automatically from latitude/longitude, so the two can never disagree
+    conn.execute(text("""
+        ALTER TABLE road_events
+        ADD COLUMN IF NOT EXISTS geom geometry(Point, 4326)
+        GENERATED ALWAYS AS (ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)) STORED
+    """))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS idx_road_events_geom ON road_events USING GIST (geom)"
+    ))
 
 
 # ---------- Validation ----------
@@ -65,16 +77,6 @@ class ReportIn(BaseModel):
 
 
 # ---------- Helpers ----------
-def haversine_m(lat1, lon1, lat2, lon2):
-    """Distance between two GPS points in metres."""
-    R = 6371000
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = p2 - p1
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
-
-
 def severity_for(avg_vibration):
     if avg_vibration >= 3.5:
         return "High"
@@ -96,42 +98,54 @@ def maps_link(lat, lon):
     return f"https://www.google.com/maps?q={lat:.6f},{lon:.6f}"
 
 
-def build_clusters(rows, radius_m=15, min_devices=2):
-    """Group reports within radius_m; verified = reported by >= min_devices different devices."""
-    clusters = []
-    for r in rows:
-        for c in clusters:
-            if haversine_m(c["lat"], c["lon"], r.latitude, r.longitude) <= radius_m:
-                c["reports"].append(r)
-                c["sum_lat"] += r.latitude
-                c["sum_lon"] += r.longitude
-                n = len(c["reports"])
-                c["lat"], c["lon"] = c["sum_lat"] / n, c["sum_lon"] / n
-                break
-        else:
-            clusters.append({
-                "lat": r.latitude, "lon": r.longitude,
-                "sum_lat": r.latitude, "sum_lon": r.longitude,
-                "reports": [r],
-            })
+# PostGIS clusters the points: any chain of reports within :radius metres forms one group
+CLUSTER_SQL = text("""
+WITH pts AS (
+    SELECT device_id, vibration, created_at, geom,
+           ST_ClusterDBSCAN(ST_Transform(geom, :srid), :radius, 1) OVER () AS cid
+    FROM road_events
+    WHERE event = 'possible_pothole'
+      AND (CAST(:cutoff AS timestamp) IS NULL OR created_at >= :cutoff)
+)
+SELECT ST_Y(ST_Centroid(ST_Collect(geom))) AS latitude,
+       ST_X(ST_Centroid(ST_Collect(geom))) AS longitude,
+       COUNT(*) AS report_count,
+       COUNT(DISTINCT device_id) AS device_count,
+       ROUND(AVG(vibration)::numeric, 2) AS avg_vibration,
+       MAX(vibration) AS max_vibration,
+       MIN(created_at) AS first_seen,
+       MAX(created_at) AS last_seen
+FROM pts
+GROUP BY cid
+""")
+
+
+def run_clusters(radius_m=15, min_devices=2, days=None):
+    cutoff = None
+    if days:
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            CLUSTER_SQL, {"srid": METRIC_SRID, "radius": radius_m, "cutoff": cutoff}
+        ).mappings().all()
+    finally:
+        db.close()
 
     result = []
-    for c in clusters:
-        reps = c["reports"]
-        devices = {r.device_id for r in reps}
-        vib = [r.vibration for r in reps]
-        avg = round(sum(vib) / len(vib), 2)
+    for r in rows:
+        avg = float(r["avg_vibration"])
         result.append({
-            "latitude": c["lat"],
-            "longitude": c["lon"],
-            "report_count": len(reps),
-            "device_count": len(devices),
+            "latitude": r["latitude"],
+            "longitude": r["longitude"],
+            "report_count": r["report_count"],
+            "device_count": r["device_count"],
             "avg_vibration": avg,
-            "max_vibration": max(vib),
+            "max_vibration": r["max_vibration"],
             "severity": severity_for(avg),
-            "first_seen": min(r.created_at for r in reps),
-            "last_seen": max(r.created_at for r in reps),
-            "status": "verified" if len(devices) >= min_devices else "unconfirmed",
+            "first_seen": r["first_seen"],
+            "last_seen": r["last_seen"],
+            "status": "verified" if r["device_count"] >= min_devices else "unconfirmed",
         })
     return result
 
@@ -148,8 +162,7 @@ def analyse(days, radius_m, min_devices):
     finally:
         db.close()
 
-    pothole_rows = [r for r in rows if r.event == "possible_pothole"]
-    clusters = build_clusters(pothole_rows, radius_m, min_devices)
+    clusters = run_clusters(radius_m, min_devices, days)
     verified = sorted(
         [c for c in clusters if c["status"] == "verified"],
         key=lambda c: (c["avg_vibration"], c["device_count"]),
@@ -166,7 +179,7 @@ def analyse(days, radius_m, min_devices):
         "devices": sorted({r.device_id for r in rows}),
         "verified": verified,
         "unconfirmed": unconfirmed,
-        "pothole_reports": len(pothole_rows),
+        "pothole_reports": sum(1 for r in rows if r.event == "possible_pothole"),
         "first": min((r.created_at for r in rows), default=None),
         "last": max((r.created_at for r in rows), default=None),
     }
@@ -175,17 +188,17 @@ def analyse(days, radius_m, min_devices):
 # ---------- API ----------
 app = FastAPI(title="TerraTrack API")
 
-
-@app.get("/", include_in_schema=False)
-def dashboard():
-    return FileResponse("dashboard.html")
-
 API_KEY = os.getenv("API_KEY")  # not set on your laptop, so no check locally
 
 
 def check_api_key(x_api_key: Optional[str] = Header(None)):
     if API_KEY and not (x_api_key and secrets.compare_digest(x_api_key, API_KEY)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse("dashboard.html")
 
 
 @app.post("/report", status_code=201, dependencies=[Depends(check_api_key)])
@@ -223,21 +236,9 @@ def list_reports(limit: int = 100):
 
 
 @app.get("/potholes")
-def potholes(radius_m: float = 15, min_devices: int = 2, limit: int = 5000):
-    db = SessionLocal()
-    try:
-        rows = (
-            db.query(RoadEvent)
-            .filter(RoadEvent.event == "possible_pothole")
-            .order_by(RoadEvent.id.desc())
-            .limit(limit)
-            .all()
-        )
-    finally:
-        db.close()
-
+def potholes(radius_m: float = 15, min_devices: int = 2):
     out = []
-    for c in build_clusters(rows, radius_m, min_devices):
+    for c in run_clusters(radius_m, min_devices):
         c["first_seen"] = c["first_seen"].isoformat()
         c["last_seen"] = c["last_seen"].isoformat()
         out.append(c)
@@ -329,8 +330,8 @@ def pothole_report(
   Prepared by: {html.escape(PREPARED_BY)}<br>
   Generated: {generated}<br>
   Period: {period}<br>
-  Verification rule: reports within {radius_m:g} m are grouped; a location is
-  <b>verified</b> when at least {min_devices} different devices reported it.
+  Verification rule: reports within {radius_m:g} m of one another are grouped (PostGIS spatial
+  clustering); a location is <b>verified</b> when at least {min_devices} different devices reported it.
 </div>
 
 <h2>Summary</h2>
