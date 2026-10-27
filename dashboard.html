@@ -43,6 +43,7 @@ let firstLoad = true;
 
 function popupHtml(p) {
   return `<b>${p.status.toUpperCase()}</b><br>` +
+         (p.basis ? "Verified by: " + p.basis + "<br>" : "") +
          `Devices: ${p.device_count}<br>` +
          `Reports: ${p.report_count}<br>` +
          `Avg vibration: ${p.avg_vibration} (max ${p.max_vibration})<br>` +
