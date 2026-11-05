@@ -1,8 +1,17 @@
 import os
+import sys
 import uuid
 from datetime import datetime, timezone
 
 import requests
+
+# Usage:  python test_hardware_format.py [LAT LON]
+DEFAULT_LAT, DEFAULT_LON = 28.6139, 77.2090
+
+if len(sys.argv) >= 3:
+    BASE_LAT, BASE_LON = float(sys.argv[1]), float(sys.argv[2])
+else:
+    BASE_LAT, BASE_LON = DEFAULT_LAT, DEFAULT_LON
 
 BASE = os.getenv("TT_URL", "http://127.0.0.1:8000")
 HEADERS = {"X-API-Key": os.getenv("TT_API_KEY", "")}
@@ -15,7 +24,7 @@ def now_iso():
 
 def make(event_id, **changes):
     r = {"device_id": "TT-TEST", "event_id": f"{run}-{event_id}", "recorded_at": now_iso(),
-         "latitude": 12.9720, "longitude": 77.5950, "vibration": 3.1,
+         "latitude": BASE_LAT + 0.0004, "longitude": BASE_LON + 0.0004, "vibration": 3.1,
          "speed_kmph": 32.0, "satellites": 8, "hdop": 1.2, "event": "possible_pothole"}
     r.update(changes)
     return r
@@ -26,6 +35,7 @@ def send(label, payload):
     print(label, "->", r.status_code, r.json())
 
 
+print(f"Testing {BASE} around {BASE_LAT}, {BASE_LON}")
 print(requests.get(f"{BASE}/health", timeout=90).json())
 send("1 normal report           ", make("1"))
 send("2 same event_id (retry)   ", make("1"))
